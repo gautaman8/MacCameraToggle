@@ -2,138 +2,237 @@ import Cocoa
 
 // MARK: - Camera Manager
 
-/// Manages camera enable/disable state using macOS configuration profiles.
-/// Installs a restriction profile (com.apple.applicationaccess with allowCamera=false)
-/// to disable the camera, and removes it to re-enable.
+/// Manages camera enable/disable state by automating the Screen Time
+/// "Allow Camera" toggle in System Settings via AppleScript UI scripting.
+///
+/// Requires: System Settings > Privacy & Security > Accessibility permission
+/// for CameraToggle.app (or Terminal if running the binary directly).
 class CameraManager {
 
-    static let profileIdentifier = "com.personal.camera-toggle"
-    static let profileDisplayName = "Camera Toggle"
+    private let defaults = UserDefaults.standard
+    private let stateKey = "cameraDisabled"
 
-    private let stateFileURL: URL = {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".camera-toggle-disabled")
-    }()
-
-    private var profileFileURL: URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!
-        let dir = appSupport.appendingPathComponent("CameraToggle")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("DisableCamera.mobileconfig")
-    }
-
-    /// Returns true if the camera is currently disabled (state file exists).
+    /// Locally tracked state (persists across launches via UserDefaults).
     var isCameraDisabled: Bool {
-        return FileManager.default.fileExists(atPath: stateFileURL.path)
+        get { defaults.bool(forKey: stateKey) }
+        set { defaults.set(newValue, forKey: stateKey) }
     }
 
-    /// Toggles the camera state. Returns true on success.
+    /// Toggle the Allow Camera switch in Screen Time settings.
+    /// Returns true if the AppleScript executed without error.
     @discardableResult
     func toggle() -> Bool {
-        if isCameraDisabled {
-            return enableCamera()
+        let wantDisabled = !isCameraDisabled
+
+        print("[CameraToggle] Toggling camera to \(wantDisabled ? "DISABLED" : "ENABLED") ...")
+
+        let script = buildToggleScript()
+
+        if runAppleScript(script) {
+            isCameraDisabled = wantDisabled
+            print("[CameraToggle] Success. Camera is now \(wantDisabled ? "DISABLED" : "ENABLED").")
+            return true
+        }
+        print("[CameraToggle] Toggle failed.")
+        return false
+    }
+
+    /// Dump the UI element hierarchy of the current System Settings window.
+    /// Useful for debugging when the toggle script can't find elements.
+    /// Run the app from Terminal to see the output.
+    func dumpUI() {
+        print("[CameraToggle] Opening System Settings and dumping UI hierarchy ...")
+        print("[CameraToggle] This may take several seconds ...")
+
+        let script = """
+        do shell script "open 'x-apple.systempreferences:com.apple.ScreenTime-Settings.extension'"
+        delay 3
+
+        tell application "System Events"
+            tell process "System Settings"
+                set frontmost to true
+                delay 1
+
+                set output to ""
+                set allElems to entire contents of window 1
+                repeat with elem in allElems
+                    try
+                        set elemClass to class of elem as string
+                        set elemName to ""
+                        try
+                            set elemName to name of elem
+                        end try
+                        set elemRole to ""
+                        try
+                            set elemRole to role of elem as string
+                        end try
+                        set elemDesc to ""
+                        try
+                            set elemDesc to description of elem as string
+                        end try
+                        set elemVal to ""
+                        try
+                            set elemVal to value of elem as string
+                        end try
+                        set output to output & elemClass & " | name=" & elemName & " | role=" & elemRole & " | desc=" & elemDesc & " | val=" & elemVal & linefeed
+                    end try
+                end repeat
+                return output
+            end tell
+        end tell
+        """
+
+        if let result = runAppleScriptWithResult(script) {
+            print("--- UI HIERARCHY ---")
+            print(result)
+            print("--- END ---")
         } else {
-            return disableCamera()
+            print("[CameraToggle] Failed to dump UI. Make sure Accessibility permission is granted.")
         }
     }
 
-    /// Disables the camera by installing a restriction configuration profile.
-    func disableCamera() -> Bool {
-        createProfileFile()
+    // MARK: - Private
 
-        let path = profileFileURL.path
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+    /// Build the AppleScript that navigates System Settings and toggles "Allow Camera".
+    ///
+    /// Flow (macOS Sonoma / Sequoia):
+    ///   1. Open System Settings > Screen Time
+    ///   2. Search for "Content & Privacy" row and click it
+    ///   3. Wait, then search for "App Restrictions" row and click it
+    ///   4. In the resulting sheet, find the "Allow Camera" checkbox and click it
+    ///   5. Click "Done"
+    ///   6. Quit System Settings
+    private func buildToggleScript() -> String {
+        return """
+        -- 1. Open Screen Time pane
+        do shell script "open 'x-apple.systempreferences:com.apple.ScreenTime-Settings.extension'"
+        delay 2
 
-        let script = """
-        do shell script "profiles install -path \\"\(path)\\"" with administrator privileges
+        tell application "System Events"
+            tell process "System Settings"
+                set frontmost to true
+                delay 1
+
+                -- Helper: get flat list of every UI element in window
+                set allElems to entire contents of window 1
+
+                -- 2. Click "Content & Privacy" (static text, button, or row)
+                set cpFound to false
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        if eName contains "Content" and eName contains "Privacy" then
+                            set elemRole to role of elem as string
+                            if elemRole is "AXStaticText" or elemRole is "AXButton" or elemRole is "AXCell" or elemRole is "AXGroup" or elemRole is "AXRow" then
+                                click elem
+                                set cpFound to true
+                                exit repeat
+                            end if
+                        end if
+                    end try
+                end repeat
+
+                if not cpFound then
+                    repeat with elem in allElems
+                        try
+                            set eDesc to description of elem as string
+                            if eDesc contains "Content" and eDesc contains "Privacy" then
+                                click elem
+                                set cpFound to true
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                end if
+
+                delay 1.5
+
+                -- 3. Click "App Restrictions" (if a separate sub-page)
+                set allElems to entire contents of window 1
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        if eName contains "App Restriction" then
+                            click elem
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                delay 1.5
+
+                -- 4. Find and click the "Allow Camera" checkbox / toggle
+                set allElems to entire contents of window 1
+                set camFound to false
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        set eRole to role of elem as string
+                        if eName is "Allow Camera" and (eRole is "AXCheckBox" or eRole is "AXSwitch") then
+                            click elem
+                            set camFound to true
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                if not camFound then
+                    repeat with elem in allElems
+                        try
+                            set eDesc to description of elem as string
+                            set eRole to role of elem as string
+                            if eDesc is "Allow Camera" and (eRole is "AXCheckBox" or eRole is "AXSwitch") then
+                                click elem
+                                set camFound to true
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                end if
+
+                delay 0.5
+
+                -- 5. Click "Done" button
+                set allElems to entire contents of window 1
+                repeat with elem in allElems
+                    try
+                        if (name of elem) is "Done" and (role of elem as string) is "AXButton" then
+                            click elem
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+            end tell
+        end tell
+
+        delay 0.5
+
+        -- 6. Quit System Settings
+        tell application "System Settings" to quit
         """
-
-        if runAppleScript(script) {
-            FileManager.default.createFile(atPath: stateFileURL.path, contents: Data())
-            return true
-        }
-        return false
     }
 
-    /// Enables the camera by removing the restriction configuration profile.
-    func enableCamera() -> Bool {
-        let identifier = Self.profileIdentifier
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-
-        let script = """
-        do shell script "profiles remove -identifier \\"\(identifier)\\"" with administrator privileges
-        """
-
-        if runAppleScript(script) {
-            try? FileManager.default.removeItem(at: stateFileURL)
-            try? FileManager.default.removeItem(at: profileFileURL)
-            return true
-        }
-        return false
-    }
-
-    /// Writes the .mobileconfig XML profile to disk.
-    private func createProfileFile() {
-        let xml = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
-        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>PayloadContent</key>
-            <array>
-                <dict>
-                    <key>PayloadType</key>
-                    <string>com.apple.applicationaccess</string>
-                    <key>PayloadVersion</key>
-                    <integer>1</integer>
-                    <key>PayloadIdentifier</key>
-                    <string>\(Self.profileIdentifier).restriction</string>
-                    <key>PayloadUUID</key>
-                    <string>A1B2C3D4-E5F6-4A90-ABCD-EF1234567890</string>
-                    <key>PayloadEnabled</key>
-                    <true/>
-                    <key>allowCamera</key>
-                    <false/>
-                </dict>
-            </array>
-            <key>PayloadType</key>
-            <string>Configuration</string>
-            <key>PayloadVersion</key>
-            <integer>1</integer>
-            <key>PayloadIdentifier</key>
-            <string>\(Self.profileIdentifier)</string>
-            <key>PayloadUUID</key>
-            <string>F1E2D3C4-B5A6-4C90-1234-567890ABCDEF</string>
-            <key>PayloadDisplayName</key>
-            <string>\(Self.profileDisplayName)</string>
-            <key>PayloadDescription</key>
-            <string>Disables the built-in camera. Managed by CameraToggle menu bar app.</string>
-            <key>PayloadOrganization</key>
-            <string>Personal</string>
-            <key>PayloadRemovalDisallowed</key>
-            <false/>
-        </dict>
-        </plist>
-        """
-
-        try? xml.write(to: profileFileURL, atomically: true, encoding: .utf8)
-    }
-
-    /// Executes an AppleScript string. Returns true on success.
     private func runAppleScript(_ source: String) -> Bool {
         guard let script = NSAppleScript(source: source) else { return false }
         var error: NSDictionary?
         script.executeAndReturnError(&error)
         if let error = error {
-            print("AppleScript error: \(error)")
+            print("[CameraToggle] AppleScript error: \(error)")
             return false
         }
         return true
+    }
+
+    private func runAppleScriptWithResult(_ source: String) -> String? {
+        guard let script = NSAppleScript(source: source) else { return nil }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        if let error = error {
+            print("[CameraToggle] AppleScript error: \(error)")
+            return nil
+        }
+        return result.stringValue
     }
 }
 
@@ -152,6 +251,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         updateIcon()
+
+        print("[CameraToggle] App launched. Look for the camera icon in the menu bar.")
+        print("[CameraToggle] IMPORTANT: Grant Accessibility permission to this app in")
+        print("  System Settings > Privacy & Security > Accessibility")
     }
 
     // MARK: NSMenuDelegate - rebuild menu each time it opens
@@ -190,6 +293,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // ---- Debug: Dump UI ----
+        let debugItem = NSMenuItem(
+            title: "Debug: Dump UI Elements",
+            action: #selector(debugDumpUI),
+            keyEquivalent: "d"
+        )
+        debugItem.target = self
+        menu.addItem(debugItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // ---- Quit ----
         let quitItem = NSMenuItem(
             title: "Quit CameraToggle",
@@ -217,8 +331,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             showNotification(
                 title: "CameraToggle",
-                message: "Failed to toggle camera. Make sure you entered the correct admin password."
+                message: "Toggle failed. Check Accessibility permission and run from Terminal for debug output."
             )
+        }
+    }
+
+    @objc private func debugDumpUI() {
+        print("[CameraToggle] Starting UI dump (run from Terminal to see output) ...")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.cameraManager.dumpUI()
         }
     }
 
