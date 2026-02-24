@@ -2,15 +2,16 @@
 
 A lightweight macOS menu bar app to quickly enable or disable the built-in camera.
 
-It works by installing/removing a macOS **configuration profile** that sets `allowCamera = false` (the same restriction available under Screen Time > Content & Privacy > App Restrictions).
+It works by **automating System Settings via AppleScript** to toggle the Screen Time "Allow Camera" setting (Screen Time > Content & Privacy > App Restrictions).
 
 ---
 
 ## Requirements
 
-- macOS 11.0 (Big Sur) or later
+- macOS 13.0 (Ventura) or later
 - Xcode Command Line Tools (`xcode-select --install`)
-- Admin password (prompted each time you toggle)
+- **Accessibility permission** for CameraToggle (System Settings > Privacy & Security > Accessibility)
+- Screen Time enabled with Content & Privacy turned on
 
 ---
 
@@ -44,7 +45,8 @@ A camera icon will appear in your menu bar. Click it to toggle.
 
 Click the icon to open the menu:
 
-- **Enable / Disable Camera** - toggles the restriction (prompts for admin password)
+- **Enable / Disable Camera** - toggles the Screen Time Allow Camera setting
+- **Debug: Dump UI Elements** - prints UI hierarchy to Terminal (for troubleshooting)
 - **Quit CameraToggle** - exits the app
 
 A macOS notification confirms each toggle.
@@ -81,11 +83,24 @@ cp -R build/CameraToggle.app /Applications/
 
 ## How It Works
 
-1. **Disable camera**: A `.mobileconfig` configuration profile containing `allowCamera: false` is generated and installed via the `profiles` CLI tool with admin privileges.
-2. **Enable camera**: The profile is removed via `profiles remove`.
-3. **State tracking**: A sentinel file `~/.camera-toggle-disabled` tracks the current state so the menu bar icon stays in sync across launches.
+1. **Toggle**: The app uses **AppleScript UI automation** to open System Settings, navigate to Screen Time > Content & Privacy > App Restrictions, and click the "Allow Camera" toggle.
+2. **State tracking**: Camera state is persisted via `UserDefaults` so the menu bar icon stays in sync across launches.
+3. **System Settings**: Opens briefly during toggle, then closes automatically.
 
-The configuration profile uses the `com.apple.applicationaccess` payload, the same mechanism macOS Screen Time and MDM solutions use to restrict camera access.
+This approach directly toggles the same Screen Time setting you would change manually.
+
+---
+
+## First-Time Setup
+
+1. **Grant Accessibility permission**:
+   - System Settings > Privacy & Security > Accessibility
+   - Click "+" and add `CameraToggle.app` (or `Terminal` if running the binary directly)
+   - This is required for the app to interact with System Settings UI
+
+2. **Enable Screen Time Content & Privacy**:
+   - System Settings > Screen Time > Content & Privacy
+   - Make sure the Content & Privacy toggle is ON
 
 ---
 
@@ -98,36 +113,32 @@ Run once:
 xattr -cr build/CameraToggle.app
 ```
 
-### Toggle fails / password dialog doesn't appear
+### Toggle doesn't work / no visible change
 
-- Make sure you're running from a graphical session (not SSH).
-- Check that `profiles` is available: `which profiles` should return `/usr/bin/profiles`.
+1. **Check Accessibility permission** is granted (see First-Time Setup above)
+2. **Run from Terminal** to see debug output:
+   ```bash
+   ./build/CameraToggle.app/Contents/MacOS/CameraToggle
+   ```
+3. **Use the Debug menu**: Click "Debug: Dump UI Elements" in the menu bar dropdown, then check Terminal output. This shows the exact UI element names System Settings exposes.
+4. The UI element names may vary by macOS version. If the auto-detection fails, share the debug dump output so the script can be adjusted.
 
-### Camera still works after disabling
+### State icon out of sync
 
-- Some apps may cache camera access. Try quitting and reopening the app that uses the camera.
-- Verify the profile is installed: `profiles list` (may require `sudo`).
-
-### State file out of sync
-
-If the icon shows the wrong state, click the menu and toggle once. Or manually remove the state file:
-
-```bash
-rm ~/.camera-toggle-disabled
-```
+If the icon shows the wrong state, toggle once to resync. The state is stored in UserDefaults.
 
 ---
 
 ## Uninstall
 
 1. Quit CameraToggle from the menu bar.
-2. If camera is currently disabled, enable it first (or run `sudo profiles remove -identifier com.personal.camera-toggle`).
-3. Delete the app and state file:
+2. If camera is currently disabled, re-enable it via Screen Time settings manually.
+3. Delete the app:
 
 ```bash
 rm -rf build/CameraToggle.app
-rm -f ~/.camera-toggle-disabled
-rm -rf ~/Library/Application\ Support/CameraToggle
+# If moved to Applications:
+rm -rf /Applications/CameraToggle.app
 ```
 
 ---
