@@ -5,6 +5,9 @@ import Cocoa
 /// Manages camera enable/disable state by automating the Screen Time
 /// "Allow Camera" toggle in System Settings via AppleScript UI scripting.
 ///
+/// Navigation: System Settings > Screen Time > Content & Privacy >
+///             App Restrictions > Allow Camera
+///
 /// Requires: System Settings > Privacy & Security > Accessibility permission
 /// for CameraToggle.app (or Terminal if running the binary directly).
 class CameraManager {
@@ -19,7 +22,7 @@ class CameraManager {
     }
 
     /// Toggle the Allow Camera switch in Screen Time settings.
-    /// Returns true if the AppleScript executed without error.
+    /// Returns true if the script reported SUCCESS.
     @discardableResult
     func toggle() -> Bool {
         let wantDisabled = !isCameraDisabled
@@ -28,55 +31,135 @@ class CameraManager {
 
         let script = buildToggleScript()
 
-        if runAppleScript(script) {
-            isCameraDisabled = wantDisabled
-            print("[CameraToggle] Success. Camera is now \(wantDisabled ? "DISABLED" : "ENABLED").")
-            return true
+        if let result = runAppleScriptWithResult(script) {
+            print("[CameraToggle] Script result: \(result)")
+            if result.contains("SUCCESS") {
+                isCameraDisabled = wantDisabled
+                print("[CameraToggle] Camera is now \(wantDisabled ? "DISABLED" : "ENABLED").")
+                return true
+            }
         }
-        print("[CameraToggle] Toggle failed.")
+        print("[CameraToggle] Toggle failed. Run from Terminal to see details.")
         return false
     }
 
-    /// Dump the UI element hierarchy of the current System Settings window.
-    /// Useful for debugging when the toggle script can't find elements.
+    /// Dump the UI element hierarchy at each navigation step.
     /// Run the app from Terminal to see the output.
     func dumpUI() {
-        print("[CameraToggle] Opening System Settings and dumping UI hierarchy ...")
+        print("[CameraToggle] Opening System Settings > Screen Time and dumping UI ...")
         print("[CameraToggle] This may take several seconds ...")
 
         let script = """
-        do shell script "open 'x-apple.systempreferences:com.apple.ScreenTime-Settings.extension'"
-        delay 3
+        tell application "System Settings"
+            activate
+        end tell
+        delay 2
 
         tell application "System Events"
             tell process "System Settings"
                 set frontmost to true
                 delay 1
 
-                set output to ""
+                -- Click Screen Time in sidebar
                 set allElems to entire contents of window 1
                 repeat with elem in allElems
                     try
-                        set elemClass to class of elem as string
-                        set elemName to ""
-                        try
-                            set elemName to name of elem
-                        end try
-                        set elemRole to ""
-                        try
-                            set elemRole to role of elem as string
-                        end try
-                        set elemDesc to ""
-                        try
-                            set elemDesc to description of elem as string
-                        end try
-                        set elemVal to ""
-                        try
-                            set elemVal to value of elem as string
-                        end try
-                        set output to output & elemClass & " | name=" & elemName & " | role=" & elemRole & " | desc=" & elemDesc & " | val=" & elemVal & linefeed
+                        if (name of elem) is "Screen Time" and (role of elem as string) is "AXStaticText" then
+                            click elem
+                            exit repeat
+                        end if
                     end try
                 end repeat
+
+                delay 2
+
+                -- Dump Screen Time pane
+                set output to "=== SCREEN TIME PANE ===" & linefeed
+                set allElems to entire contents of window 1
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        set eRole to role of elem as string
+                        set eDesc to ""
+                        try
+                            set eDesc to description of elem as string
+                        end try
+                        set eVal to ""
+                        try
+                            set eVal to value of elem as string
+                        end try
+                        set output to output & eRole & " | " & eName & " | desc=" & eDesc & " | val=" & eVal & linefeed
+                    end try
+                end repeat
+
+                -- Try clicking Content & Privacy
+                set cpFound to false
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        if eName contains "Content" and eName contains "Privacy" then
+                            click elem
+                            set cpFound to true
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                if cpFound then
+                    delay 2
+                    set output to output & linefeed & "=== CONTENT & PRIVACY PANE ===" & linefeed
+                    set allElems to entire contents of window 1
+                    repeat with elem in allElems
+                        try
+                            set eName to name of elem
+                            set eRole to role of elem as string
+                            set eDesc to ""
+                            try
+                                set eDesc to description of elem as string
+                            end try
+                            set eVal to ""
+                            try
+                                set eVal to value of elem as string
+                            end try
+                            set output to output & eRole & " | " & eName & " | desc=" & eDesc & " | val=" & eVal & linefeed
+                        end try
+                    end repeat
+
+                    -- Try clicking App Restrictions
+                    set arFound to false
+                    repeat with elem in allElems
+                        try
+                            set eName to name of elem
+                            if eName contains "App Restriction" or eName contains "App restrictions" then
+                                click elem
+                                set arFound to true
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+
+                    if arFound then
+                        delay 2
+                        set output to output & linefeed & "=== APP RESTRICTIONS PANE ===" & linefeed
+                        set allElems to entire contents of window 1
+                        repeat with elem in allElems
+                            try
+                                set eName to name of elem
+                                set eRole to role of elem as string
+                                set eDesc to ""
+                                try
+                                    set eDesc to description of elem as string
+                                end try
+                                set eVal to ""
+                                try
+                                    set eVal to value of elem as string
+                                end try
+                                set output to output & eRole & " | " & eName & " | desc=" & eDesc & " | val=" & eVal & linefeed
+                            end try
+                        end repeat
+                    end if
+                end if
+
                 return output
             end tell
         end tell
@@ -95,17 +178,21 @@ class CameraManager {
 
     /// Build the AppleScript that navigates System Settings and toggles "Allow Camera".
     ///
-    /// Flow (macOS Sonoma / Sequoia):
-    ///   1. Open System Settings > Screen Time
-    ///   2. Search for "Content & Privacy" row and click it
-    ///   3. Wait, then search for "App Restrictions" row and click it
-    ///   4. In the resulting sheet, find the "Allow Camera" checkbox and click it
-    ///   5. Click "Done"
-    ///   6. Quit System Settings
+    /// Flow:
+    ///   1. Open System Settings, activate it
+    ///   2. Click "Screen Time" in the sidebar
+    ///   3. Click "Content & Privacy"
+    ///   4. Enable "Content & Privacy" toggle if it's off
+    ///   5. Click "App Restrictions"
+    ///   6. Click the "Allow Camera" checkbox/switch
+    ///   7. Click "Done"
+    ///   8. Quit System Settings
     private func buildToggleScript() -> String {
         return """
-        -- 1. Open Screen Time pane
-        do shell script "open 'x-apple.systempreferences:com.apple.ScreenTime-Settings.extension'"
+        -- 1. Open System Settings
+        tell application "System Settings"
+            activate
+        end tell
         delay 2
 
         tell application "System Events"
@@ -113,57 +200,87 @@ class CameraManager {
                 set frontmost to true
                 delay 1
 
-                -- Helper: get flat list of every UI element in window
+                -- 2. Click "Screen Time" in the sidebar
                 set allElems to entire contents of window 1
-
-                -- 2. Click "Content & Privacy" (static text, button, or row)
-                set cpFound to false
+                set stFound to false
                 repeat with elem in allElems
                     try
-                        set eName to name of elem
-                        if eName contains "Content" and eName contains "Privacy" then
-                            set elemRole to role of elem as string
-                            if elemRole is "AXStaticText" or elemRole is "AXButton" or elemRole is "AXCell" or elemRole is "AXGroup" or elemRole is "AXRow" then
-                                click elem
-                                set cpFound to true
-                                exit repeat
-                            end if
-                        end if
-                    end try
-                end repeat
-
-                if not cpFound then
-                    repeat with elem in allElems
-                        try
-                            set eDesc to description of elem as string
-                            if eDesc contains "Content" and eDesc contains "Privacy" then
-                                click elem
-                                set cpFound to true
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-                end if
-
-                delay 1.5
-
-                -- 3. Click "App Restrictions" (if a separate sub-page)
-                set allElems to entire contents of window 1
-                repeat with elem in allElems
-                    try
-                        set eName to name of elem
-                        if eName contains "App Restriction" then
+                        if (name of elem) is "Screen Time" and (role of elem as string) is "AXStaticText" then
                             click elem
+                            set stFound to true
                             exit repeat
                         end if
                     end try
                 end repeat
 
-                delay 1.5
+                if not stFound then
+                    tell application "System Settings" to quit
+                    return "FAIL: Could not find Screen Time in sidebar"
+                end if
 
-                -- 4. Find and click the "Allow Camera" checkbox / toggle
+                delay 2
+
+                -- 3. Click "Content & Privacy"
                 set allElems to entire contents of window 1
+                set cpFound to false
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        if eName contains "Content" and eName contains "Privacy" then
+                            click elem
+                            set cpFound to true
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                if not cpFound then
+                    tell application "System Settings" to quit
+                    return "FAIL: Could not find Content & Privacy"
+                end if
+
+                delay 2
+
+                -- 4. Check if Content & Privacy toggle needs to be enabled
+                set allElems to entire contents of window 1
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        set eRole to role of elem as string
+                        if (eName contains "Content" and eName contains "Privacy") and (eRole is "AXCheckBox" or eRole is "AXSwitch") then
+                            set eVal to value of elem
+                            if eVal is 0 then
+                                click elem
+                                delay 1.5
+                                set allElems to entire contents of window 1
+                            end if
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                -- 5. Click "App Restrictions"
+                set arFound to false
+                repeat with elem in allElems
+                    try
+                        set eName to name of elem
+                        if eName contains "App Restriction" or eName contains "App restrictions" then
+                            click elem
+                            set arFound to true
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+
+                if arFound then
+                    delay 2
+                    set allElems to entire contents of window 1
+                end if
+
+                -- 6. Find and click the "Allow Camera" toggle
                 set camFound to false
+
+                -- Try exact match on name with checkbox/switch role
                 repeat with elem in allElems
                     try
                         set eName to name of elem
@@ -176,6 +293,7 @@ class CameraManager {
                     end try
                 end repeat
 
+                -- Fallback: try description match
                 if not camFound then
                     repeat with elem in allElems
                         try
@@ -190,9 +308,29 @@ class CameraManager {
                     end repeat
                 end if
 
+                -- Fallback: partial name match containing "Camera"
+                if not camFound then
+                    repeat with elem in allElems
+                        try
+                            set eName to name of elem
+                            set eRole to role of elem as string
+                            if eName contains "Camera" and (eRole is "AXCheckBox" or eRole is "AXSwitch") then
+                                click elem
+                                set camFound to true
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                end if
+
+                if not camFound then
+                    tell application "System Settings" to quit
+                    return "FAIL: Could not find Allow Camera toggle"
+                end if
+
                 delay 0.5
 
-                -- 5. Click "Done" button
+                -- 7. Click "Done" button (if present in a sheet/dialog)
                 set allElems to entire contents of window 1
                 repeat with elem in allElems
                     try
@@ -208,8 +346,10 @@ class CameraManager {
 
         delay 0.5
 
-        -- 6. Quit System Settings
+        -- 8. Quit System Settings
         tell application "System Settings" to quit
+
+        return "SUCCESS"
         """
     }
 
@@ -302,6 +442,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debugItem.target = self
         menu.addItem(debugItem)
 
+        // ---- Reset State ----
+        let resetItem = NSMenuItem(
+            title: "Reset State to Camera ON",
+            action: #selector(resetState),
+            keyEquivalent: "r"
+        )
+        resetItem.target = self
+        menu.addItem(resetItem)
+
         menu.addItem(NSMenuItem.separator())
 
         // ---- Quit ----
@@ -331,7 +480,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             showNotification(
                 title: "CameraToggle",
-                message: "Toggle failed. Check Accessibility permission and run from Terminal for debug output."
+                message: "Toggle failed. Run from Terminal to see details."
             )
         }
     }
@@ -341,6 +490,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.cameraManager.dumpUI()
         }
+    }
+
+    /// Reset locally tracked state to Camera ON without touching System Settings.
+    /// Use this if the menu bar icon gets out of sync with the actual setting.
+    @objc private func resetState() {
+        cameraManager.isCameraDisabled = false
+        updateIcon()
+        showNotification(
+            title: "CameraToggle",
+            message: "State reset to Camera ON. (Icon only - does not change the actual setting.)"
+        )
     }
 
     @objc private func quitApp() {
